@@ -3,6 +3,7 @@
 # **************************************************************************
 # *
 # * Author:  James A. Geraets (j.geraets@fz-juelich.de)
+# *          Karunakar Pothula
 # *
 # * This program is free software; you can redistribute it and/or modify
 # * it under the terms of the GNU General Public License as published by
@@ -25,30 +26,51 @@ import os
 import sys
 import math
 import numpy as np
-from itertools import izip
+from itertools import izip, count
+from collections import defaultdict
 
 from pyrelion import MetaData
 import argparse
+import os.path
 
 from decimal import Decimal
 from matplotlib import pyplot as plt
 from sklearn.cluster import KMeans, AgglomerativeClustering
 from sklearn.decomposition import PCA as sklearnPCA
+from scipy.spatial.distance import cdist
 
 class LazyExtract(MetaData):
+    def __init__(self, input_star):
+        MetaData.__init__(self, input_star=input_star)
+        self._filamentIds = None
+        self._classIds = None
     def __iter__(self):
+        self.filamentIds()
         for item in self._data:
-            yield item.rlnHelicalTubeID, item.rlnClassNumber
+            yield item.rlnFilamentID, item.rlnClassNumber
     def classIds(self):
-        return dict((j,i) for i,j in enumerate(sorted(set(item.rlnClassNumber for item in self._data))))
+        if self._classIds:
+            return self._classIds
+        else:
+            self._classIds = dict((j,i) for i,j in enumerate(sorted(set(item.rlnClassNumber for item in self._data))))
+            return self._classIds
     def filamentIds(self):
-        return dict((j,i) for i,j in enumerate(sorted(set(item.rlnHelicalTubeID for item in self._data))))
+        if self._filamentIds:
+            return self._filamentIds
+        else:
+            filamentIdAssign = defaultdict(count(start=1).next)
+            for item in self._data:
+                item.rlnFilamentID = filamentIdAssign[str(item.rlnHelicalTubeID) + "-" + item.rlnMicrographName]
+            self._filamentIds = dict((i,i-1) for i in filamentIdAssign.values())
+            return self._filamentIds
+        #return dict((j,i) for i,j in enumerate(sorted(set(item.rlnHelicalTubeID for item in self._data))))
 
 class CreateClusters():
     def define_parser(self):
         self.parser = argparse.ArgumentParser(
             description="Clusters helical particles from 2D classification.")
-        self.parser.add_argument('input_star', help="Input STAR filename with particles and micrograph names.")
+        self.parser.add_argument('input_star', nargs='+', help="Input STAR filename(s) with particles and micrograph names.")
+        self.parser.add_argument('-x', action='store_true', help="No display - run as command line only.")
 
     def usage(self):
         self.parser.print_help()
@@ -64,42 +86,85 @@ class CreateClusters():
         self.define_parser()
         args = self.parser.parse_args()
 
-        if len(sys.argv) == 1:
-            self.error("No input particles STAR file given.")
-
         print "Creating coordinate files..."
-
-        #md = MetaData(args.input_star)
-
-        #filaments, classes = izip(*((particle.rlnHelicalTubeID, particle.rlnClassNumber) for particle in md))
-
-        #filament_ids = dict((j,i) for i,j in enumerate(sorted(set(filaments))))
-        #class_ids = dict((j,i) for i,j in enumerate(sorted(set(classes))))
         
-        #fc_matrix = np.zeros((len(filament_ids), len(class_ids)))
-        #fc_matrix_norm = np.zeros((len(filament_ids), len(class_ids)))
-        
-        #for f, c in izip(filaments, classes):
-        #    print f, filament_ids[f], c, class_ids[c]
+        for star in args.input_star:
+            print star
 
-        #print filament_ids, class_ids
+            le = LazyExtract(star)
 
-        le = LazyExtract(args.input_star)
+            filament_ids = le.filamentIds()
+            class_ids = le.classIds()
 
-        filament_ids = le.filamentIds()
-        class_ids = le.classIds()
+            print filament_ids
 
-        fc_matrix = np.zeros((len(filament_ids), len(class_ids)), dtype=np.float)
+            print class_ids
 
-        for f,c in le:
-            fc_matrix[filament_ids[f], class_ids[c]] += 1
-        fc_matrix_norm = fc_matrix / fc_matrix.sum(axis=1,keepdims=True)
+            fc_matrix = np.zeros((len(le.filamentIds()), len(le.classIds())), dtype=np.float)
 
-        print fc_matrix_norm 
-        kmeans = KMeans(n_clusters=2, random_state=2).fit(fc_matrix_norm)
-        y_kmeans = kmeans.predict(fc_matrix_norm)
-        print("kmeans clustering")
-        print(y_kmeans)
+            for f,c in le:
+                fc_matrix[le.filamentIds()[f], le.classIds()[c]] += 1
+            fc_matrix_norm = fc_matrix / fc_matrix.sum(axis=1,keepdims=True)
+
+            print fc_matrix_norm 
+            kmeans = KMeans(n_clusters=2, random_state=2).fit(fc_matrix_norm)
+            y_kmeans = kmeans.predict(fc_matrix_norm)
+            print "kmeans clustering"
+            print y_kmeans
+            ward_clust = AgglomerativeClustering(n_clusters=2, affinity = 'euclidean', linkage = 'ward')
+            ward_link = ward_clust.fit_predict(fc_matrix_norm)
+            print "ward clustering"
+            print ward_link
+            comp_clust = AgglomerativeClustering(n_clusters=2, affinity = 'euclidean', linkage = 'complete')
+            comp_link = comp_clust.fit_predict(fc_matrix_norm)
+            print "complete clustering"
+            print comp_link
+            aver_clust = AgglomerativeClustering(n_clusters=2, affinity = 'euclidean', linkage = 'average')
+            aver_link = aver_clust.fit_predict(fc_matrix_norm)
+            print "average clustering"
+            print aver_link
+
+            try:
+                sklearn_pca = sklearnPCA(n_components=2)
+                y_pca = sklearn_pca.fit_transform(fc_matrix_norm)
+            except ValueError as e:
+                print "WARNING: PCA failed with 2 components"
+                print e
+                continue
+
+            distortions = []
+            K = range(1,10)
+            for k in K:
+                kmeanModel = KMeans(n_clusters=k).fit(fc_matrix_norm)
+                kmeanModel.fit(fc_matrix_norm)
+                distortions.append(sum(np.min(cdist(fc_matrix_norm, kmeanModel.cluster_centers_, 'euclidean'), axis=1)) / fc_matrix_norm.shape[0])
+
+            fig=plt.figure()
+            plt.subplot(231)
+            plt.scatter(y_pca[:, 0], y_pca[:, 1], c=y_kmeans, label=y_kmeans, alpha=0.5)
+            plt.title("k-means")
+
+            plt.subplot(232)
+            plt.scatter(y_pca[:, 0], y_pca[:, 1], c=ward_link, label=ward_link, alpha=0.5)
+            plt.title("Ward Linkage")
+
+            plt.subplot(233)
+            plt.scatter(y_pca[:, 0], y_pca[:, 1], c=comp_link, label=comp_link,alpha=0.5)
+            plt.title("Complete Linkage")
+
+            plt.subplot(234)
+            plt.scatter(y_pca[:, 0], y_pca[:, 1], c=aver_link, label=aver_link, alpha=0.5)
+            plt.title("Average Linkage")
+
+            plt.subplot(235)
+            plt.plot(K, distortions, '-ok', c='black')
+            plt.xlabel('k')
+            plt.ylabel('Distortion')
+            plt.title('The Elbow Method showing the optimal k')
+            if not args.x:
+                plt.show()
+            fig.savefig(os.path.splitext(star)[0] + ".clustering.pdf")
+            plt.clf()
 
 if __name__ == "__main__":
     CreateClusters().main()
